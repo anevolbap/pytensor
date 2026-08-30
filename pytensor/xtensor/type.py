@@ -43,10 +43,24 @@ from pytensor.tensor.basic import tensor_from_scalar
 from pytensor.tensor.variable import TensorConstantSignature, TensorVariable
 
 
+_READONLY_ATTRS = frozenset({"dtype", "shape", "ndim", "broadcastable", "dims"})
+
+
 class XTensorType(Type, HasDataType, HasShape):
-    """A `Type` for Xtensors (Xarray-like tensors with dims)."""
+    """A `Type` for Xtensors (Xarray-like tensors with dims).
+
+    `dims`, `shape`, `ndim`, `broadcastable` and `dtype` are read-only. They
+    describe each other, so setting one in place would leave the others stale.
+    Use `clone` to build a type with different values.
+    """
 
     __props__ = ("dtype", "shape", "dims")
+
+    dims: tuple[str, ...]
+    broadcastable: tuple[bool, ...]
+    name: str | None
+    numpy_dtype: np.dtype
+    filter_checks_isfinite: bool
 
     def __init__(
         self,
@@ -56,30 +70,42 @@ class XTensorType(Type, HasDataType, HasShape):
         shape: Sequence[int | None] | None = None,
         name: str | None = None,
     ):
+        # Bypasses the read-only guard in `__setattr__` while building.
+        set_ = object.__setattr__
         if dtype == "floatX":
-            self.dtype = config.floatX
+            set_(self, "dtype", config.floatX)
         else:
-            self.dtype = np.dtype(dtype).name
+            set_(self, "dtype", np.dtype(dtype).name)
 
         if isinstance(dims, str):
             dims = (dims,)
-        self.dims = tuple(dims)
+        set_(self, "dims", tuple(dims))
         if len(set(dims)) < len(dims):
             raise ValueError(f"Dimensions must be unique. Found duplicates in {dims}: ")
         if shape is None:
-            self.shape = (None,) * len(self.dims)
+            set_(self, "shape", (None,) * len(self.dims))
         else:
-            self.shape = tuple(shape)
+            set_(self, "shape", tuple(shape))
             if len(self.shape) != len(self.dims):
                 raise ValueError(
                     f"Shape {self.shape} must have the same length as dims {self.dims}"
                 )
-        self.ndim = len(self.dims)
-        self.name = name
-        self.numpy_dtype = np.dtype(self.dtype)
-        self.filter_checks_isfinite = False
+        set_(self, "ndim", len(self.dims))
+        set_(self, "name", name)
+        set_(self, "numpy_dtype", np.dtype(self.dtype))
+        set_(self, "filter_checks_isfinite", False)
         # broadcastable is here just for code that would work fine with XTensorType but checks for it
-        self.broadcastable = (False,) * self.ndim
+        set_(self, "broadcastable", (False,) * self.ndim)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # `dims`, `shape`, `ndim` and `broadcastable` describe each other, so
+        # setting one in place would leave the others stale. Guarding writes
+        # keeps reads on the plain attribute path; properties would not.
+        if name in _READONLY_ATTRS:
+            raise AttributeError(
+                f"{type(self).__name__}.{name} is read-only; use `clone()` to get a new type"
+            )
+        object.__setattr__(self, name, value)
 
     def clone(
         self,

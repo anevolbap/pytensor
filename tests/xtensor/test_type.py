@@ -274,3 +274,25 @@ def test_where():
     res = xr_function([a], out)(a_test)
     expected = a_test[0].where(a_test > 1, -1)
     xr_assert_allclose(res, expected)
+
+
+@pytest.mark.parametrize("attr", ["dtype", "shape", "ndim", "broadcastable", "dims"])
+def test_type_attrs_are_read_only(attr):
+    # Reassigning `dims` used to leave `ndim` stale, which crashed shape
+    # inference during rewriting. See #2329.
+    xtensor_type = xtensor("a", dims=("obs", "feature")).type
+    with pytest.raises(AttributeError, match="read-only"):
+        setattr(xtensor_type, attr, getattr(xtensor_type, attr))
+
+
+def test_dims_cannot_desync_ndim():
+    a = xtensor("a", dims=("obs", "feature"))
+    with pytest.raises(AttributeError, match="read-only"):
+        a.type.dims = ("g1", "g2", "obs", "feature")
+    assert a.type.ndim == len(a.type.dims)
+
+
+def test_filter_checks_isfinite_stays_writable():
+    xtensor_type = xtensor("a", dims=("obs", "feature")).type
+    xtensor_type.filter_checks_isfinite = True
+    assert xtensor_type.filter_checks_isfinite
