@@ -1,16 +1,25 @@
 import inspect
+import os
+import tempfile
+import time
 from functools import singledispatch
+from pathlib import Path
 
 import numpy as np
+import pytest
 
 from pytensor import config
 from pytensor.graph.basic import Apply
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
+from pytensor.link import utils as link_utils
 from pytensor.link.utils import (
+    clear_old_generated_src,
+    compile_function_src,
     fgraph_to_python,
     get_name_for_object,
     unique_name_generator,
+    write_generated_src,
 )
 from pytensor.scalar.basic import Add, float64
 from pytensor.tensor import constant
@@ -238,3 +247,86 @@ def test_unique_name_generator():
 
     r_name_3 = unique_names(r)
     assert r_name_2 == r_name_3
+
+
+SRC_ONE = "def one():\n    return 1\n"
+
+
+@pytest.fixture
+def generated_src_dir(tmp_path, monkeypatch):
+    dirname = tmp_path / "generated_src"
+    monkeypatch.setattr(link_utils, "_generated_src_dir", lambda: dirname)
+    return dirname
+
+
+def _make_old(path):
+    long_ago = time.time() - 60 * 60 * 24 * 365
+    os.utime(path, (long_ago, long_ago))
+
+
+def test_write_generated_src_is_content_addressed(generated_src_dir):
+    first = write_generated_src(SRC_ONE)
+    second = write_generated_src(SRC_ONE)
+
+    assert first == second
+    # One file and no leftover .tmp from the atomic write.
+    assert list(generated_src_dir.iterdir()) == [Path(first)]
+    assert Path(first).read_text() == SRC_ONE
+    assert write_generated_src("def one():\n    return 2\n") != first
+
+
+def test_compile_function_src_leaves_nothing_in_tempdir(
+    generated_src_dir, tmp_path, monkeypatch
+):
+    """Generated source used to pile up in TMPDIR, one file per compiled function."""
+    tempdir = tmp_path / "tmp"
+    tempdir.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tempdir))
+    monkeypatch.setenv("TMPDIR", str(tempdir))
+
+    fn = compile_function_src(SRC_ONE, "one")
+
+    assert fn() == 1
+    assert list(tempdir.iterdir()) == []
+
+
+def test_compile_function_src_source_stays_readable(generated_src_dir):
+    """Tracebacks and Numba's type inference read the source back from disk."""
+    fn = compile_function_src(SRC_ONE, "one")
+
+    assert inspect.getsource(fn) == SRC_ONE
+
+
+def test_write_generated_src_rewrites_truncated_file(generated_src_dir):
+    """A file truncated by an earlier crash must not be reused for good."""
+    path = Path(write_generated_src(SRC_ONE))
+    path.write_text("")
+
+    assert Path(write_generated_src(SRC_ONE)) == path
+    assert path.read_text() == SRC_ONE
+
+
+def test_clear_old_generated_src(generated_src_dir):
+    fresh = Path(write_generated_src(SRC_ONE))
+    stale = Path(write_generated_src("def two():\n    return 2\n"))
+    orphan = generated_src_dir / "leftover.tmp"
+    orphan.write_text("partially written")
+    _make_old(stale)
+    _make_old(orphan)
+
+    clear_old_generated_src()
+
+    assert fresh.exists()
+    assert not stale.exists()
+    assert not orphan.exists()
+
+
+def test_write_generated_src_keeps_reused_file_young(generated_src_dir):
+    """Reuse refreshes the mtime, so the pruner spares source still in use."""
+    path = Path(write_generated_src(SRC_ONE))
+    _make_old(path)
+
+    write_generated_src(SRC_ONE)
+    clear_old_generated_src()
+
+    assert path.exists()

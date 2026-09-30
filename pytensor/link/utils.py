@@ -1,13 +1,18 @@
+import atexit
 import builtins
+import contextlib
 import io
 import re
 import sys
+import time
 import traceback
 import warnings
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
+from hashlib import sha256
 from keyword import iskeyword
 from operator import itemgetter
+from pathlib import Path
 from tempfile import NamedTemporaryFile
 from textwrap import dedent, indent
 from typing import (
@@ -588,15 +593,93 @@ def register_thunk_trace_excepthook(handler: TextIO = sys.stdout) -> None:
 register_thunk_trace_excepthook()
 
 
+GENERATED_SRC_DIRNAME = "generated_src"
+
+
+def _generated_src_dir() -> Path:
+    return config.base_compiledir / GENERATED_SRC_DIRNAME
+
+
+def clear_old_generated_src() -> None:
+    """Remove generated source files, and leftover ``.tmp`` files, not used in a long time."""
+    # Same threshold as `ModuleCache.age_thresh_del` for the C compiledir.
+    threshold = time.time() - (config.cmodule__age_thresh_use + 60 * 60 * 24 * 7)
+    try:
+        entries = list(_generated_src_dir().iterdir())
+    except OSError:
+        return
+
+    for entry in entries:
+        try:
+            if entry.stat().st_mtime < threshold:
+                entry.unlink()
+        except OSError:
+            # The file is already gone, or another process is pruning the same
+            # directory.
+            continue
+
+
+_generated_src_cleanup_registered = False
+
+
+def write_generated_src(src: str) -> str:
+    """Write generated source to a content-addressed file and return its name.
+
+    The file is kept after compilation: its name is passed to `compile`, and it
+    is read back to render tracebacks and by Numba's source-based type inference.
+    """
+    global _generated_src_cleanup_registered
+    if not _generated_src_cleanup_registered:
+        # Register lazily, so processes that never generate source skip the scan.
+        atexit.register(clear_old_generated_src)
+        _generated_src_cleanup_registered = True
+
+    encoded = src.encode()
+    dirname = _generated_src_dir()
+    dirname.mkdir(parents=True, exist_ok=True)
+    filename = dirname / f"{sha256(encoded).hexdigest()[:32]}.py"
+
+    try:
+        # A file of the wrong size was truncated by an earlier crash. Reusing
+        # it would break `inspect.getsource` for good, because the name of a
+        # given source never changes.
+        complete = filename.stat().st_size == len(encoded)
+    except OSError:
+        complete = False
+
+    if complete:
+        # Keep the file young, so that `clear_old_generated_src` does not
+        # remove source that is still in use.
+        with contextlib.suppress(OSError):
+            filename.touch()
+        return str(filename)
+
+    # Write to a temporary name first, so that a concurrent process never sees
+    # a partially written file under `filename`.
+    with NamedTemporaryFile(dir=dirname, suffix=".tmp", delete=False) as f:
+        tmp_name = Path(f.name)
+        f.write(encoded)
+    try:
+        tmp_name.replace(filename)
+    except OSError:
+        # On Windows the replacement fails when another process created the
+        # file first and still holds it open. Both files hold the same source,
+        # so keeping the existing one is correct.
+        if not filename.exists():
+            raise
+    finally:
+        tmp_name.unlink(missing_ok=True)
+
+    return str(filename)
+
+
 def compile_function_src(
     src: str,
     function_name: str,
     global_env: dict[Any, Any] | None = None,
     local_env: dict[Any, Any] | None = None,
 ) -> Callable:
-    with NamedTemporaryFile(delete=False) as f:
-        filename = f.name
-        f.write(src.encode())
+    filename = write_generated_src(src)
 
     if global_env is None:
         global_env = {}
